@@ -430,7 +430,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
     # Scale?
     if min_dim:
         # Scale up but not down
-        scale = max(1, min_dim / min(h, w))
+        scale = max(1, min_dim / float(min(h, w)))
     if min_scale and scale < min_scale:
         scale = min_scale
 
@@ -438,7 +438,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
     if max_dim and mode == "square":
         image_max = max(h, w)
         if round(image_max * scale) > max_dim:
-            scale = max_dim / image_max
+            scale = max_dim / float(image_max)
 
     # Resize image using bilinear interpolation
     if scale != 1:
@@ -728,8 +728,8 @@ def compute_ap(gt_boxes, gt_class_ids, gt_masks,
         iou_threshold)
 
     # Compute precision and recall at each prediction box step
-    precisions = np.cumsum(pred_match > -1) / (np.arange(len(pred_match)) + 1)
-    recalls = np.cumsum(pred_match > -1).astype(np.float32) / len(gt_match)
+    precisions = np.cumsum(pred_match > -1) / float((np.arange(len(pred_match)) + 1))
+    recalls = np.cumsum(pred_match > -1).astype(np.float32) / float(len(gt_match))
 
     # Pad with start and end values to simplify the math
     precisions = np.concatenate([[0], precisions, [0]])
@@ -787,7 +787,7 @@ def compute_recall(pred_boxes, gt_boxes, iou):
     positive_ids = np.where(iou_max >= iou)[0]
     matched_gt_boxes = iou_argmax[positive_ids]
 
-    recall = len(set(matched_gt_boxes)) / gt_boxes.shape[0]
+    recall = len(set(matched_gt_boxes)) / float(gt_boxes.shape[0])
     return recall, positive_ids
 
 

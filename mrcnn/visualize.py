@@ -58,7 +58,7 @@ def random_colors(N, bright=True):
     convert to RGB.
     """
     brightness = 1.0 if bright else 0.7
-    hsv = [(i / N, 1, brightness) for i in range(N)]
+    hsv = [(i / float(N), 1, brightness) for i in range(N)]
     colors = list(map(lambda c: colorsys.hsv_to_rgb(*c), hsv))
     random.shuffle(colors)
     return colors
@@ -259,7 +259,7 @@ def draw_rois(image, rois, refined_rois, mask, class_ids, class_names, limit=10)
     print("Positive ROIs: ", class_ids[class_ids > 0].shape[0])
     print("Negative ROIs: ", class_ids[class_ids == 0].shape[0])
     print("Positive Ratio: {:.2f}".format(
-        class_ids[class_ids > 0].shape[0] / class_ids.shape[0]))
+        class_ids[class_ids > 0].shape[0] / float(class_ids.shape[0])))
 
 
 # TODO: Replace with matplotlib equivalent?
