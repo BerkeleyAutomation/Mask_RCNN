@@ -241,23 +241,19 @@ class Dataset(object):
     To use it, create a new class that adds functions specific to the dataset
     you want to use. For example:
 
-    class CatsAndDogsDataset(Dataset):
-        def load_cats_and_dogs(self):
-            ...
-        def load_mask(self, image_id):
-            ...
-        def image_reference(self, image_id):
-            ...
-
-    See COCODataset and ShapesDataset as examples.
     """
 
-    def __init__(self, class_map=None):
-        self._image_ids = []
-        self.image_info = []
+    def __init__(self, config, class_map=None):
+        self._example_indices = []
+        self.example_info = []
         # Background is always the first class
         self.class_info = [{"source": "", "id": 0, "name": "BG"}]
         self.source_class_ids = {}
+        self._channels = config['model']['settings']['image_channel_count']
+
+    def load():
+        # TODO: Implement subclasses
+        pass
 
     def add_class(self, source, class_id, class_name):
         assert "." not in source, "Source name cannot contain a dot"
@@ -273,23 +269,20 @@ class Dataset(object):
             "name": class_name,
         })
 
-    def add_image(self, source, image_id, path, **kwargs):
+    def add_example(self, source, image_id, **kwargs):
         image_info = {
             "id": image_id,
             "source": source,
-            "path": path,
         }
         image_info.update(kwargs)
-        self.image_info.append(image_info)
-
-    def image_reference(self, image_id):
-        """Return a link to the image in its source Website or details about
-        the image that help looking it up or debugging it.
-
-        Override for your dataset, but pass to this function
-        if you encounter images not in your dataset.
-        """
-        return ""
+        self.example_info.append(image_info)
+    
+    def example_reference(self, example_id):
+        info = self.example_info[example_id]
+        if "flip" in info:
+            return info["path"] + "-{:d}".format(info["flip"])
+        else:
+            return info["path"]
 
     def prepare(self, class_map=None):
         """Prepares the Dataset class for use.
@@ -306,14 +299,14 @@ class Dataset(object):
         self.num_classes = len(self.class_info)
         self.class_ids = np.arange(self.num_classes)
         self.class_names = [clean_name(c["name"]) for c in self.class_info]
-        self.num_images = len(self.image_info)
-        self._image_ids = np.arange(self.num_images)
+        self.num_examples = len(self.example_info)
+        self._example_indices = np.arange(self.num_examples)
 
-        # Mapping from source class and image IDs to internal IDs
+        # Mapping from source class and example IDs to internal indices
         self.class_from_source_map = {"{}.{}".format(info['source'], info['id']): id
                                       for info, id in zip(self.class_info, self.class_ids)}
-        self.image_from_source_map = {"{}.{}".format(info['source'], info['id']): id
-                                      for info, id in zip(self.image_info, self.image_ids)}
+        self.example_from_source_map = {"{}.{}".format(info['source'], info['id']): id
+                                      for info, id in zip(self.example_info, self.example_indices)}
 
         # Map sources to class_ids they support
         self.sources = list(set([i['source'] for i in self.class_info]))
@@ -342,47 +335,41 @@ class Dataset(object):
         return info['id']
 
     @property
-    def image_ids(self):
-        return self._image_ids
+    def example_indices(self):
+        return self._example_indices
 
-    def source_image_link(self, image_id):
-        """Returns the path or URL to the image.
-        Override this to return a URL to the image if it's available online for easy
-        debugging.
-        """
-        return self.image_info[image_id]["path"]
-
-    def load_image(self, image_id):
-        """Load the specified image and return a [H,W,3] Numpy array.
-        """
-        # Load image
-        image = skimage.io.imread(self.image_info[image_id]['path'])
-        # If grayscale. Convert to RGB for consistency.
-        if image.ndim != 3:
+    def _load_image(self, path):
+        """Internal image loading method. Handles multiple channels and alpha channel."""
+        if 'numpy' in self.images:
+            image = np.load(path).squeeze()
+        else:
+            image = skimage.io.imread(path)
+        
+        if self._channels < 4 and image.shape[-1] == 4 and image.ndim == 3:
+            image = image[...,:3]
+        if self._channels == 1 and image.ndim == 2:
+            image = image[:,:,np.newaxis]
+        elif self._channels == 1 and image.ndim == 3:
+            image = image[:,:,0,np.newaxis]
+        elif self._channels == 3 and image.ndim == 3 and image.shape[-1] == 1:
             image = skimage.color.gray2rgb(image)
-        # If has an alpha channel, remove it for consistency
-        if image.shape[-1] == 4:
-            image = image[..., :3]
         return image
 
-    def load_mask(self, image_id):
-        """Load instance masks for the given image.
-
-        Different datasets use different ways to store masks. Override this
-        method to load instance masks and return them in the form of am
-        array of binary masks of shape [height, width, instances].
-
-        Returns:
-            masks: A bool array of shape [height, width, instance count] with
-                a binary mask per instance.
-            class_ids: a 1D array of class IDs of the instance masks.
-        """
-        # Override this function to load a mask from your dataset.
-        # Otherwise, it returns an empty mask.
-        logging.warning("You are using the default load_mask(), maybe you need to define your own one.")
-        mask = np.empty([0, 0, 0])
-        class_ids = np.empty([0], np.int32)
-        return mask, class_ids
+    def _load_mask(self, path):
+        """Internal mask and class id loading method."""
+        all_masks = skimage.io.imread(path)
+        Is = []
+        for i in np.arange(1,np.max(all_masks)+1):
+            I = all_masks == i # We ignore the background, so the first instance is 0-indexed.
+            if np.any(I):
+                I = I[:,:,np.newaxis]
+                Is.append(I)
+        if len(Is) > 0:
+            mask = np.concatenate(Is, 2)
+        else:
+            raise ValueError("Path yielded empty mask- something is wrong!")
+        class_ids = np.array([1 for _ in range(mask.shape[2])])
+        return mask, class_ids.astype(np.int32)
 
 
 def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square"):
