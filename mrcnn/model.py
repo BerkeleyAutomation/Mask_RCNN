@@ -660,7 +660,6 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, gt_targ
 
     if config.TARGET_BRANCH:
         assert gt_targets != None, "target branch enabled but gt_targets missing in detection_targets_graph"
-        
         # Target y/n is basically another class label. Trim to non-zero RoIs,
         # assign target labels to RoIs, pad.
         gt_targets = tf.boolean_mask(gt_targets, non_zeros,
@@ -721,7 +720,6 @@ class DetectionTargetLayer(KE.Layer):
 
         if self.config.TARGET_BRANCH and gt_targets is None:
             raise ValueError("Target branch enabled but gt_targets is None in DetectionTargetLayer")
-            
 
         # Slice the batch and run a graph for each slice
         # TODO: Rename target_bbox to target_deltas for clarity
@@ -771,7 +769,7 @@ def refine_detections_graph(rois, probs, deltas, target_probs, window, config):
 
     Returns detections shaped: [num_detections, (y1, x1, y2, x2, class_id, score)] where
         coordinates are normalized.
-    If target_branch enabled, becomes shaped: 
+    If target_branch enabled, becomes shaped:
         [num_detections, (y1, x1, y2, x2, class_id, score, P(not target), P(target))]
 
     """
@@ -855,7 +853,7 @@ def refine_detections_graph(rois, probs, deltas, target_probs, window, config):
 
     # Add target branch prob to detection
     if config.TARGET_BRANCH:
-        detections = tf.concat([detections, tf.gather(target_probs, keep)], axis=1)  
+        detections = tf.concat([detections, tf.gather(target_probs, keep)], axis=1)
 
     # Pad with zeros if detections < DETECTION_MAX_INSTANCES
     gap = config.DETECTION_MAX_INSTANCES - tf.shape(detections)[0]
@@ -910,7 +908,7 @@ class DetectionLayer(KE.Layer):
         # Reshape output
         # [batch, num_detections, (y1, x1, y2, x2, class_id, class_score)] in
         # normalized coordinates
-        
+
         return tf.reshape(
             detections_batch,
             [self.config.BATCH_SIZE, self.config.DETECTION_MAX_INSTANCES, self.detection_dim])
@@ -996,27 +994,45 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 ### Add new graph head for comparing, call PyramidROIAlign on both incoming branch
 
 def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
-                     image_target_meta, input_target_bb, pool_size):
+                     target_image_meta, input_target_bb, pool_size, stack_size, combiner):
     """Builds Siamese network graph for input and target features
     """
     dist_layer_size = 1024
 
     # ROI pooling input
+    input_target_bb = KL.Reshape((stack_size, 1, 4))(input_target_bb)
     x_input = PyramidROIAlign([pool_size, pool_size],
                               name="roi_align_siamese_input")([rois, image_meta] + feature_maps)
 
     # ROI pooling target
-    input_target_bb = KL.Reshape((1, 4))(input_target_bb)
+    def roi_align_target_stack(inputs):
+        inputs = [tf.transpose(vec, [1, 0] + list(range(2, len(vec.shape)))) for vec in inputs]
+        input_target_bb = inputs[0]
+        target_image_meta = inputs[1]
+        target_feature_maps = inputs[2:]
+        outputs = utils.batch_slice(
+            [input_target_bb, target_image_meta] + target_feature_maps,
+            lambda bb, meta, fm1, fm2, fm3, fm4: PyramidROIAlign([pool_size, pool_size])(
+                [bb, meta] + [fm1, fm2, fm3, fm4]),
+            stack_size
+        )
+        outputs = tf.transpose(outputs, [1, 0] + list(range(2, len(outputs.shape))))
+        return outputs
 
-    x_target = PyramidROIAlign([pool_size, pool_size],
-                               name="roi_align_siamese_target")([input_target_bb,
-                                                                 image_target_meta] +
-                                                                target_feature_maps)
+    x_target = KL.Lambda(roi_align_target_stack)([input_target_bb, target_image_meta] + target_feature_maps)
 
+    # Combining stacked representations
+    assert combiner in ["mean", "max"], combiner + " is an invalid combiner."
+    if combiner == "mean":
+        combiner = KL.Lambda(lambda x: tf.reduce_mean(x, axis=1))
+    elif combiner == "max":
+        combiner = KL.Lambda(lambda x: tf.reduce_max(x, axis=1))
+
+    x_target = combiner(x_target)
     x_target_stack = KL.Lambda(lambda x: K.repeat_elements(x, K.int_shape(rois)[1], 1))(x_target)
 
     x = KL.Subtract(name="comparison_layer")([x_input, x_target_stack])
-    # [batch, num_rois, feature_size]
+    # [batch, num_rois, 7, 7, 256]
     # TimeDistributed operates over index 1 (num_rois)
 
     # As inspired by fpn_classifier_graph, we run a FC layer over it, implemented
@@ -1365,45 +1381,49 @@ def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
 ############################################################
 
 def load_target(target_dataset, config, target_id):
-    """Load and return target, bb, and metadata. Must pass in a
+    """Load and return target stacks, bbs, and metadata. Must pass in a
     dataset.TargetDataset object.
 
-    Assmes that target images are all zeros except the actual object pixels. Uses
+    Assumes that target images are all zeros except the actual object pixels. Uses
     utils.resize_image() to pad the image to the proper size, and extract_bboxes to
     obtain bounding box coordinates.
     """
     example = target_dataset.load_example(target_id)
-    image = example['target_image']
-    target_index = example['target_index']
-    
-    # image = target_dataset.load_target(target_id)
-    # target_index = target_dataset.load_target_index(target_id)
 
-    original_shape = image.shape
-    image, window, scale, padding, crop = utils.resize_image(
-        image,
-        min_dim=config.IMAGE_MIN_DIM,
-        min_scale=config.IMAGE_MIN_SCALE,
-        max_dim=config.IMAGE_MAX_DIM,
-        mode=config.IMAGE_RESIZE_MODE)
+    target_images = []
+    target_bbs = []
+    target_metas = []
+    for target_image in example['target_images']:
+        original_shape = target_image.shape
+        target_image, window, scale, padding, crop = utils.resize_image(
+        target_image,
+            min_dim=config.IMAGE_MIN_DIM,
+            min_scale=config.IMAGE_MIN_SCALE,
+            max_dim=config.IMAGE_MAX_DIM,
+            mode=config.IMAGE_RESIZE_MODE)
 
-    # print(image, window, scale, padding, crop)
+        target_images.append(target_image)
 
-    # need to make one "mask instance"
-    image_mask = (np.sum(image, axis=2) != 0).astype(np.int32) # mask the target object (now shape is (H, W, 1))
+        # need to make one "mask instance"
+        target_image_mask = (np.sum(target_image, axis=2) != 0).astype(np.int32) # mask the target object (now shape is (H, W, 1))
+        bb = utils.extract_bboxes(
+            target_image_mask.reshape((target_image.shape[0], target_image.shape[1], 1)))[0]
+        target_bbs.append(bb)
 
-    bb = utils.extract_bboxes(image_mask.reshape((image.shape[0], image.shape[1], 1)))[0]
-    # bb = np.array([bb[0] / image_mask.shape[0], bb[1] / image_mask.shape[1], bb[2] /
-    #                image_mask.shape[0], bb[3] / image_mask.shape[1]], dtype=np.float32)
+        active_class_ids = np.array([0, 1])
+        target_image_meta = compose_image_meta(target_id, original_shape, target_image.shape,
+                                               window, scale, active_class_ids)
+        target_metas.append(target_image_meta)
 
-    active_class_ids = np.array([0, 1])
-
-    image_meta = compose_image_meta(target_id, original_shape, image.shape,
-                                    window, scale, active_class_ids)
+    target_image_stack = np.stack(target_images)
+    target_bb_stack = np.stack(target_bbs)
+    target_meta_stack = np.stack(target_metas)
 
     all_masks, class_ids = example['pile_mask'], example['class_ids']
 
     num_masks = all_masks.shape[2]
+
+    target_index = example['target_index']
     if target_index >= num_masks:
         raise DataException("id {} target index exceeds number of masks".format(target_id))
 
@@ -1413,7 +1433,7 @@ def load_target(target_dataset, config, target_id):
     if target_index >= 0:
         target_vector[target_index] = 1
 
-    return image, bb, image_meta, target_vector
+    return target_image_stack, target_bb_stack, target_meta_stack, target_vector
 
 
 def load_image_gt(dataset, config, image_id, use_mini_mask=False):
@@ -1485,6 +1505,7 @@ def load_image_gt(dataset, config, image_id, use_mini_mask=False):
 class DataException(Exception):
     pass
 
+
 def load_inputs_gt(dataset, config, image_id):
     """Given a Dataset and the model config, returns the original maskrcnn model inputs
     and additional inputs, if any. Makes no assumptions about the Dataset type.
@@ -1502,7 +1523,6 @@ def load_inputs_gt(dataset, config, image_id):
     target_image, target_bb, target_meta, target_index = load_target(dataset, config, image_id)
 
     extra_inputs = [target_image, target_bb, target_meta, target_index]
-
     return base_inputs, extra_inputs
 
 
@@ -1909,9 +1929,8 @@ def data_generator(dataset, config, shuffle=True,
 
             base_inputs, extra_inputs = load_inputs_gt(dataset, config, image_id)
             pile_image, pile_image_meta, gt_class_ids, gt_boxes, gt_masks = base_inputs
+            # note that these are stacked
             target_image, target_bb, target_image_meta, target_vector = extra_inputs
-
-            # print ("data_generator gt_boxes[0], target_bb", gt_boxes[0,:], target_bb)
 
             # Skip images that have no instances. This can happen in cases
             # where we3 train on a subset of classes and the image doesn't
@@ -1937,7 +1956,7 @@ def data_generator(dataset, config, shuffle=True,
                 batch_target_images = np.zeros(
                     (batch_size,) + target_image.shape, dtype=np.float32)
                 batch_target_bb = np.zeros(
-                    (batch_size, 4), dtype=np.int32)
+                    (batch_size,) + target_bb.shape, dtype=np.int32)
                 batch_target_image_meta = np.zeros(
                     (batch_size,) + target_image_meta.shape, dtype=target_image_meta.dtype)
                 batch_target_vector = np.zeros(
@@ -2071,22 +2090,39 @@ class MaskRCNN():
         rpn_feature_maps = input_image_outputs # outputs are [P2, P3, P4, P5, P6]
         mrcnn_feature_maps = input_image_outputs[:-1] # mrcnn only uses [P2, P3, P4, P5]
 
-      
         if config.TARGET_BRANCH:
             ### Add target input
             ### Incl [x, y, w, h] BB input for target
             input_target = KL.Input(
-                shape=[None, None, 3], name="input_target")
-            input_target_meta = KL.Input(shape=[config.IMAGE_META_SIZE],
+                shape=[config.STACK_SIZE, None, None, config.IMAGE_SHAPE[2]],
+                name="input_target")
+            input_target_meta = KL.Input(shape=[config.STACK_SIZE, config.IMAGE_META_SIZE],
                                      name="input_target_meta")
-            input_target_bb = KL.Input(shape=(4,),
+            input_target_bb = KL.Input(shape=(config.STACK_SIZE, 4,),
                                    name="input_target_bb", dtype=tf.float32)
-            # Normalize coordinates as was done for gt_boxes
+
+            # Normalize coordinates as was done for gt_boxes, except now target image input is
+            # (batch, stack, width, height, channels)
             target_bb = KL.Lambda(lambda x: norm_boxes_graph(
                 x,
-                K.shape(input_target)[1:3]))(input_target_bb)
+                K.shape(input_target)[2:4]))(input_target_bb)
+
+            # Slice by stack size
             # mrcnn feature maps for target image
-            target_image_feature_maps = resnet_fpn(input_target)[:-1] 
+            def resnet_fpn_target_stack(input_target):
+                # switch stack dimension with batch dimension to slice
+                # on stack, not batch
+                input_target = tf.transpose(input_target, [1, 0, 2, 3, 4])
+                output_target = utils.batch_slice(
+                    [input_target],
+                    lambda target: resnet_fpn(target)[:-1],
+                    config.STACK_SIZE
+                )
+                output_target = [tf.transpose(vec, [1, 0] + list(range(2, len(vec.shape)))) for vec in output_target]
+                return output_target
+
+            target_image_feature_maps = KL.Lambda(resnet_fpn_target_stack)(input_target)
+            # target_image_feature_maps = resnet_fpn(input_target)[:-1]
 
         if mode == "training":
             # RPN GT
@@ -2150,7 +2186,7 @@ class MaskRCNN():
         layer_outputs = []  # list of lists
         for p in rpn_feature_maps:
             layer_outputs.append(rpn([p]))
-        
+
         # Concatenate layer outputs
         # Convert from list of lists of level outputs to list of lists
         # of outputs across levels.
@@ -2186,10 +2222,10 @@ class MaskRCNN():
                 input_rois = KL.Input(shape=[config.POST_NMS_ROIS_TRAINING, 4],
                                       name="input_roi", dtype=np.int32)
                 # Normalize coordinates
-                target_rois = KL.Lambda(lambda x: norm_boxes_graph(
+                desired_rois = KL.Lambda(lambda x: norm_boxes_graph(
                     x, K.shape(input_image)[1:3]))(input_rois)
             else:
-                target_rois = rpn_rois
+                desired_rois = rpn_rois
 
             # Generate detection targets
             # Subsamples proposals and generates ground truth outputs for training
@@ -2198,11 +2234,11 @@ class MaskRCNN():
             if config.TARGET_BRANCH:
                 rois, target_class_ids, target_bbox, target_mask, target_is_target =\
                     DetectionTargetLayer(config, name="proposal_targets")(
-                        [target_rois, input_gt_class_ids, gt_boxes, input_gt_masks, input_target_gt_index])
+                        [desired_rois, input_gt_class_ids, gt_boxes, input_gt_masks, input_target_gt_index])
             else:
                 rois, target_class_ids, target_bbox, target_mask = \
                     DetectionTargetLayer(config, name="proposal_targets")(
-                        [target_rois, input_gt_class_ids, gt_boxes, input_gt_masks, input_target_gt_index])
+                        [desired_rois, input_gt_class_ids, gt_boxes, input_gt_masks])
 
             # Network Heads
             # TODO: verify that this handles zero padded ROIs
@@ -2251,16 +2287,17 @@ class MaskRCNN():
                                                 mrcnn_feature_maps,
                                                 target_image_feature_maps, input_image_meta,
                                                 input_target_meta, target_bb,
-                                                config.POOL_SIZE)
+                                                config.POOL_SIZE, config.STACK_SIZE,
+                                                config.STACK_COMBINER)
                 target_loss = KL.Lambda(
                 lambda x: target_branch_loss_graph(*x, config.POSITIVE_WEIGHT),
                 name="target_branch_loss")(
                     [target_is_target, pred_target_logits, pred_target_prob, siamese_output, features, target_feature])
 
-                
+
                 inputs = [input_target, input_target_bb, input_target_meta, input_target_gt_index] + inputs
                 outputs = outputs + [pred_target_logits, pred_target_prob, target_loss]
-            
+
             model = KM.Model(inputs, outputs, name='mask_rcnn')
 
         elif mode == 'inference':
@@ -2273,10 +2310,13 @@ class MaskRCNN():
                                        fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
             if config.TARGET_BRANCH:
                 # Target branch
-                pred_target_logits, pred_target_prob, siamese_output, features, target_feature, output_target_bb, dense = fpn_target_graph(rpn_rois, mrcnn_feature_maps,
-                                                target_image_feature_maps, input_image_meta,
-                                                input_target_meta, target_bb,
-                                                config.POOL_SIZE)
+                pred_target_logits, pred_target_prob, siamese_output, features, \
+                    target_feature, output_target_bb, dense \
+                    = fpn_target_graph(rpn_rois, mrcnn_feature_maps,
+                                       target_image_feature_maps, input_image_meta,
+                                       input_target_meta, target_bb,
+                                       config.POOL_SIZE, config.STACK_SIZE,
+                                       config.STACK_COMBINER)
             else:
                 pred_target_prob = None
 
@@ -2822,9 +2862,15 @@ class MaskRCNN():
         # Mold inputs to format expected by the neural network
         molded_images, image_metas, windows = self.mold_inputs(images)
 
-
+        molded_target_stacks = []
+        target_meta_stacks = []
+        target_window_stacks = []
         # Mold target inputs to proper format
-        molded_targets, target_metas, target_windows = self.mold_inputs(targets)
+        for target_stack in targets:
+            molded_targets, target_metas, target_windows = self.mold_inputs(target_stack)
+            molded_target_stacks.append(molded_targets)
+            target_meta_stacks.append(target_metas)
+            target_window_stacks.append(target_windows)
         target_bbs = np.array(target_bbs)
 
         # Validate image sizes
@@ -2849,7 +2895,7 @@ class MaskRCNN():
         # Run object detection
 
         detections, mrcnn_class, mrcnn_bbox, mrcnn_mask, rpn_rois, rpn_class, rpn_bbox, siamese_output, features, target_feature, input_target_bb, target_probs, t1, t2, t3, t4 =\
-            self.keras_model.predict([molded_targets, target_metas, target_bbs, molded_images, image_metas, anchors], verbose=1)
+            self.keras_model.predict([molded_target_stacks, target_meta_stacks, target_bbs, molded_images, image_metas, anchors], verbose=1)
         time_total = time.time()-time_start
 
         target_image_feature_maps = [t1, t2, t3, t4]
@@ -2857,9 +2903,6 @@ class MaskRCNN():
         results = []
         for i, image in enumerate(images):
             # detections and mrcnn_mask are of size 100, post-NMS. Bunch of them are 0s tho.
-            # print(detections[i], mrcnn_mask[image],
-            #                            image.shape, molded_images[i].shape,
-            #                            windows[i])
             final_rois, final_class_ids, final_scores, final_target_probs, final_masks =\
                 self.unmold_detections(detections[i], target_probs[i], mrcnn_mask[i],
                                        image.shape, molded_images[i].shape,
