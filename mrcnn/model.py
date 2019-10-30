@@ -178,8 +178,11 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
     """
     assert architecture in ["resnet35", "resnet50", "resnet101"]
     # Stage 1
+    print(input_image.shape)
     x = KL.ZeroPadding2D((3, 3))(input_image)
+    print(x.shape)
     x = KL.Conv2D(64, (7, 7), strides=(2, 2), name='conv1', use_bias=True)(x)
+    print(x.shape)
     x = BatchNorm(name='bn_conv1')(x, training=train_bn)
     x = KL.Activation('relu')(x)
     C1 = x = KL.MaxPooling2D((3, 3), strides=(2, 2), padding="same")(x)
@@ -208,13 +211,15 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
     return [C1, C2, C3, C4, C5]
 
 
-def build_resnet_fpn_model(config):
+def build_resnet_fpn_model(config, backbone, num_channels, name):
     """Builds and returns a Keras model of the Resnet backbone and FPN.
     Wraps the backbone graph so it can be used to featurize both input
     and target images."""
+    assert backbone in ["resnet35", "resnet50", "resnet101"]
+
     input_image = KL.Input(
-        shape=[None, None, config.IMAGE_SHAPE[2]], name="resnet_input_image")
-    _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE, stage5=True,
+        shape=[None, None, num_channels], name="resnet_input_image")
+    _, C2, C3, C4, C5 = resnet_graph(input_image, backbone, stage5=True,
                                      train_bn=config.TRAIN_BN)
 
     # Top-down Layers
@@ -240,7 +245,8 @@ def build_resnet_fpn_model(config):
 
     outputs = [P2, P3, P4, P5, P6]
 
-    return KM.Model(input_image, outputs, name="resnet_fpn_model")
+    return KM.Model(input_image, outputs, name=name)
+
 
 ############################################################
 #  Proposal Layer
@@ -1000,7 +1006,8 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 
 ### Add new graph head for comparing, call PyramidROIAlign on both incoming branch
 
-def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
+def fpn_target_graph(rois, feature_maps_depth, target_feature_maps_depth, feature_maps_rgb,
+                     target_feature_maps_rgb, image_meta,
                      target_image_meta, input_target_bb, pool_size, stack_size, combiner):
     """Builds Siamese network graph for input and target features
     """
@@ -1008,8 +1015,11 @@ def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
 
     # ROI pooling input
     input_target_bb = KL.Reshape((stack_size, 1, 4))(input_target_bb)
-    x_input = PyramidROIAlign([pool_size, pool_size],
-                              name="roi_align_siamese_input")([rois, image_meta] + feature_maps)
+    x_input_depth = PyramidROIAlign([pool_size, pool_size],
+                              name="roi_align_siamese_input")([rois, image_meta] + feature_maps_depth)
+    x_input_rgb = PyramidROIAlign([pool_size, pool_size],
+                              name="roi_align_siamese_input_rgb")([rois, image_meta] + feature_maps_rgb)
+    x_input = KL.Concatenate(axis=2)([x_input_depth, x_input_rgb])
 
     # ROI pooling target
     def roi_align_target_stack(inputs):
@@ -1026,7 +1036,8 @@ def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
         outputs = tf.transpose(outputs, [1, 0] + list(range(2, len(outputs.shape))))
         return outputs
 
-    x_target = KL.Lambda(roi_align_target_stack)([input_target_bb, target_image_meta] + target_feature_maps)
+    x_target_depth = KL.Lambda(roi_align_target_stack)([input_target_bb, target_image_meta] + target_feature_maps_depth)
+    x_target_rgb = KL.Lambda(roi_align_target_stack)([input_target_bb, target_image_meta] + target_feature_maps_rgb)
 
     # Combining stacked representations
     assert combiner in ["mean", "max"], combiner + " is an invalid combiner."
@@ -1035,7 +1046,11 @@ def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
     elif combiner == "max":
         combiner = KL.Lambda(lambda x: tf.reduce_max(x, axis=1))
 
-    x_target = combiner(x_target)
+    x_target_depth = combiner(x_target_depth)
+    x_target_rgb = combiner(x_target_rgb)
+
+    x_target = KL.Concatenate(axis=2)([x_target_depth, x_target_rgb])
+
     x_target_stack = KL.Lambda(lambda x: K.repeat_elements(x, K.int_shape(rois)[1], 1))(x_target)
 
     x = KL.Subtract(name="comparison_layer")([x_input, x_target_stack])
@@ -1044,7 +1059,7 @@ def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
 
     # As inspired by fpn_classifier_graph, we run a FC layer over it, implemented
     # with Conv2D
-    x = KL.TimeDistributed(KL.Conv2D(dist_layer_size, (pool_size, pool_size),
+    x = KL.TimeDistributed(KL.Conv2D(dist_layer_size, (pool_size * 2, pool_size),
                                           padding="valid"), name='siamese_conv1')(x)
 
     x = KL.TimeDistributed(BatchNorm(), name='siamese_bn1')(x, training=False)
@@ -1064,6 +1079,7 @@ def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
                                      name="siamese_probs")(target_logits)
 
     return target_logits, target_probs, x, x_input, x_target, input_target_bb, rois
+
 
 def fpn_classifier_graph(rois, feature_maps, image_meta,
                          pool_size, num_classes, train_bn=True,
@@ -2074,9 +2090,10 @@ class MaskRCNN():
         self.config = config
         self.model_dir = model_dir
         self.set_log_dir()
-        self.resnet_fpn_model = None
+        self.resnet_fpn_depth_model = None
+        self.resnet_fpn_rgb_model = None
         self.target_branch = hasattr(config, 'TARGET_BRANCH') and config.TARGET_BRANCH
-        self.keras_model, self.resnet_fpn_model = self.build(mode=mode, config=config)
+        self.keras_model, self.resnet_fpn_depth_model, self.resnet_fpn_rgb_model = self.build(mode=mode, config=config)
 
     def build(self, mode, config):
         """Build Mask R-CNN architecture.
@@ -2085,7 +2102,7 @@ class MaskRCNN():
                 outputs of the model differ accordingly.
         """
         assert mode in ['training', 'inference']
-
+        assert config.IMAGE_SHAPE[2] == 4, "only supports 4 channel RGBD inputs"
         # Image size must be dividable by 2 multiple times
         h, w = config.IMAGE_SHAPE[:2]
         if h / 2.**6 != int(h / 2.**6) or w / 2.**6 != int(w / 2.**6):
@@ -2096,12 +2113,18 @@ class MaskRCNN():
         # Permanent inputs and ResNet features
         input_image = KL.Input(
             shape=[None, None, config.IMAGE_SHAPE[2]], name="input_image")
+        input_image_depth = KL.Lambda(lambda x: x[:,:,:,3:])(input_image)
+        input_image_rgb = KL.Lambda(lambda x: x[:,:,:,:3])(input_image)
+
         input_image_meta = KL.Input(shape=[config.IMAGE_META_SIZE],
                                     name="input_image_meta")
-        resnet_fpn = build_resnet_fpn_model(config)
-        input_image_outputs = resnet_fpn(input_image)
+        resnet_fpn_depth = build_resnet_fpn_model(config, "resnet35", 1, "resnet_fpn_depth")
+        input_image_outputs = resnet_fpn_depth(input_image_depth)
         rpn_feature_maps = input_image_outputs # outputs are [P2, P3, P4, P5, P6]
-        mrcnn_feature_maps = input_image_outputs[:-1] # mrcnn only uses [P2, P3, P4, P5]
+        mrcnn_feature_maps_depth = input_image_outputs[:-1] # mrcnn only uses [P2, P3, P4, P5]
+
+        resnet_fpn_rgb = build_resnet_fpn_model(config, "resnet101", 3, "resnet_fpn_rgb")
+        mrcnn_feature_maps_rgb =resnet_fpn_rgb(input_image_rgb)[:-1]
 
         if self.target_branch:
             ### Add target input
@@ -2109,6 +2132,10 @@ class MaskRCNN():
             input_target = KL.Input(
                 shape=[config.STACK_SIZE, None, None, config.IMAGE_SHAPE[2]],
                 name="input_target")
+
+            input_target_depth = KL.Lambda(lambda x: x[:,:,:,:,3:])(input_target)
+            input_target_rgb = KL.Lambda(lambda x: x[:,:,:,:,:3])(input_target)
+
             input_target_meta = KL.Input(shape=[config.STACK_SIZE, config.IMAGE_META_SIZE],
                                      name="input_target_meta")
             input_target_bb = KL.Input(shape=(config.STACK_SIZE, 4,),
@@ -2122,19 +2149,24 @@ class MaskRCNN():
 
             # Slice by stack size
             # mrcnn feature maps for target image
-            def resnet_fpn_target_stack(input_target):
+            def resnet_fpn_target_stack(input_im, resnet_fpn_fn):
                 # switch stack dimension with batch dimension to slice
                 # on stack, not batch
-                input_target = tf.transpose(input_target, [1, 0, 2, 3, 4])
+                print('input_target.shape resnet_fpn_target_stack', input_im.shape)
+                input_im = tf.transpose(input_im, [1, 0, 2, 3, 4])
+                print('input_target.shape resnet_fpn_target_stack transpose', input_im.shape)
                 output_target = utils.batch_slice(
-                    [input_target],
-                    lambda target: resnet_fpn(target)[:-1],
+                    [input_im],
+                    lambda target: resnet_fpn_fn(target)[:-1],
                     config.STACK_SIZE
                 )
                 output_target = [tf.transpose(vec, [1, 0] + list(range(2, len(vec.shape)))) for vec in output_target]
                 return output_target
 
-            target_image_feature_maps = KL.Lambda(resnet_fpn_target_stack)(input_target)
+            target_image_feature_maps_depth = KL.Lambda(resnet_fpn_target_stack,
+                                                        arguments={'resnet_fpn_fn' : resnet_fpn_depth})(input_target_depth)
+            target_image_feature_maps_rgb = KL.Lambda(resnet_fpn_target_stack,
+                                                      arguments={'resnet_fpn_fn': resnet_fpn_rgb})(input_target_rgb)
             # target_image_feature_maps = resnet_fpn(input_target)[:-1]
 
         if mode == "training":
@@ -2256,12 +2288,12 @@ class MaskRCNN():
             # Network Heads
             # TODO: verify that this handles zero padded ROIs
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox =\
-                fpn_classifier_graph(rois, mrcnn_feature_maps, input_image_meta,
+                fpn_classifier_graph(rois, mrcnn_feature_maps_depth, input_image_meta,
                                      config.POOL_SIZE, config.NUM_CLASSES,
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
-            mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
+            mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps_depth,
                                               input_image_meta,
                                               config.MASK_POOL_SIZE,
                                               config.NUM_CLASSES,
@@ -2297,8 +2329,9 @@ class MaskRCNN():
             if self.target_branch:
                 pred_target_logits, pred_target_prob, siamese_output, features, target_feature, output_target_bb, dense_layer =\
                                fpn_target_graph(rois,
-                                                mrcnn_feature_maps,
-                                                target_image_feature_maps, input_image_meta,
+                                                mrcnn_feature_maps_depth, target_image_feature_maps_depth,
+                                                mrcnn_feature_maps_rgb, target_image_feature_maps_rgb,
+                                                input_image_meta,
                                                 input_target_meta, target_bb,
                                                 config.POOL_SIZE, config.STACK_SIZE,
                                                 config.STACK_COMBINER)
@@ -2329,8 +2362,10 @@ class MaskRCNN():
                 # Target branch
                 pred_target_logits, pred_target_prob, siamese_output, features, \
                     target_feature, output_target_bb, dense \
-                    = fpn_target_graph(rpn_rois, mrcnn_feature_maps,
-                                       target_image_feature_maps, input_image_meta,
+                    = fpn_target_graph(rpn_rois,
+                                       mrcnn_feature_maps, target_image_feature_maps,
+                                       mrcnn_feature_maps_rgb, target_image_feature_maps_rgb,
+                                       input_image_meta,
                                        input_target_meta, target_bb,
                                        config.POOL_SIZE, config.STACK_SIZE,
                                        config.STACK_COMBINER)
@@ -2363,7 +2398,7 @@ class MaskRCNN():
              from mrcnn.parallel_model import ParallelModel
              model = ParallelModel(model, config.GPU_COUNT)
 
-        return model, resnet_fpn
+        return model, resnet_fpn_depth, resnet_fpn_rgb
 
     def find_last(self):
         """Finds the last checkpoint file of the last trained model in the
@@ -2406,7 +2441,7 @@ class MaskRCNN():
         self.resnet_fpn_model.load_weights(backbone_path)
 
 
-    def load_weights_from_sd_mrcnn_model(self, filepath):
+    def load_weights_from_sd_mrcnn_model(self, filepath, filepath_rgb):
         """Loads weights from a pre-trained SD Mask R-CNN model into the
         Resnet backbone."""
         import h5py
@@ -2430,13 +2465,22 @@ class MaskRCNN():
         layers = keras_model.inner_model.layers if hasattr(keras_model, "inner_model")\
             else keras_model.layers
 
-        resnet_fpn_model = self.resnet_fpn_model
-        resnet_layers = resnet_fpn_model.layers
+        resnet_layers_depth = self.resnet_fpn_depth_model.layers
 
-        saving.load_weights_from_hdf5_group_by_name(f, resnet_layers)
+        saving.load_weights_from_hdf5_group_by_name(f, resnet_layers_depth)
         saving.load_weights_from_hdf5_group_by_name(f, layers)
+
+        f_rgb = h5py.File(filepath_rgb, mode='r')
+        if 'layer_names' not in f_rgb.attrs and 'model_weights' in f_rgb:
+            f_rgb = f_rgb['model_weights']
+
+        resnet_layers_rgb = self.resnet_fpn_rgb_model.layers
+        saving.load_weights_from_hdf5_group_by_name(f_rgb, resnet_layers_rgb)
+
         if hasattr(f, 'close'):
             f.close()
+        if hasattr(f_rgb, 'close'):
+            f_rgb.close()
 
         # Update the log directory
         self.set_log_dir(filepath)
