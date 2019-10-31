@@ -2740,8 +2740,6 @@ class MaskRCNN():
         # Create log_dir if it does not exist
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
-        # because this is happening at end of previous epoch, we need to increment manually
-        resnet_fpn_weights_callback = lambda epoch, logs:  self.resnet_fpn_model.save_weights(self.checkpoint_path_resnet.format(epoch=epoch+ 1))
 
         # Callbacks
         callbacks = [
@@ -2749,9 +2747,6 @@ class MaskRCNN():
                                         histogram_freq=0, write_graph=True, write_images=False),
             keras.callbacks.ModelCheckpoint(self.checkpoint_path,
                                             verbose=0, save_weights_only=True),
-            keras.callbacks.LambdaCallback(
-                on_epoch_end=resnet_fpn_weights_callback
-            )
         ]
 
         # Add custom callbacks to the list
