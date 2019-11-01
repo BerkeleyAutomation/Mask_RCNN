@@ -2350,7 +2350,7 @@ class MaskRCNN():
             # Network Heads
             # Proposal classifier and BBox regressor heads
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox =\
-                  fpn_classifier_graph(rpn_rois, mrcnn_feature_maps, input_image_meta,
+                  fpn_classifier_graph(rpn_rois, mrcnn_feature_maps_depth, input_image_meta,
                                        config.POOL_SIZE, config.NUM_CLASSES,
                                        train_bn=config.TRAIN_BN,
                                        fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
@@ -2363,7 +2363,7 @@ class MaskRCNN():
                 pred_target_logits, pred_target_prob, siamese_output, features, \
                     target_feature, output_target_bb, dense \
                     = fpn_target_graph(rpn_rois,
-                                       mrcnn_feature_maps, target_image_feature_maps,
+                                       mrcnn_feature_maps_depth, target_image_feature_maps_depth,
                                        mrcnn_feature_maps_rgb, target_image_feature_maps_rgb,
                                        input_image_meta,
                                        input_target_meta, target_bb,
@@ -2378,7 +2378,7 @@ class MaskRCNN():
             # Create masks for detections
             # THESE ARE POST-NMS!
             detection_boxes = KL.Lambda(lambda x: x[..., :4])(detections)
-            mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps,
+            mrcnn_mask = build_fpn_mask_graph(detection_boxes, mrcnn_feature_maps_depth,
                                                 input_image_meta,
                                                 config.MASK_POOL_SIZE,
                                                 config.NUM_CLASSES,
@@ -2390,7 +2390,7 @@ class MaskRCNN():
 
             if self.target_branch:
                 inputs = [input_target, input_target_meta, input_target_bb] + inputs
-                outputs = outputs + [siamese_output, features, target_feature, output_target_bb, pred_target_prob] + target_image_feature_maps
+                outputs = outputs + [siamese_output, features, target_feature, output_target_bb, pred_target_prob] + target_image_feature_maps_depth
             model = KM.Model(inputs, outputs, name='mask_rcnn')
 
         #  Add multi-GPU support.
@@ -2486,11 +2486,13 @@ class MaskRCNN():
         self.set_log_dir(filepath)
 
 
-    def load_weights(self, filepath, by_name=False, exclude=None):
+    def load_weights(self, filepath, by_name=False, exclude=None, submodel_names=None):
         """Modified version of the corresponding Keras function with
         the addition of multi-GPU support and the ability to exclude
         some layers from loading.
         exclude: list of layer names to exclude
+        submodel_names: list of submodel names. These will be loaded separately
+            due to a bug in Keras weight loading.
         """
         import h5py
         # Conditional import to support versions of Keras before 2.2
@@ -2500,6 +2502,12 @@ class MaskRCNN():
         except ImportError:
             # Keras before 2.2 used the 'topology' namespace.
             from keras.engine import topology as saving
+
+        if submodel_names is not None:
+            if exclude is None:
+                exclude = submodel_names
+            else:
+                exclude += submodel_names
 
         if exclude:
             by_name = True
@@ -2516,6 +2524,10 @@ class MaskRCNN():
         layers = keras_model.inner_model.layers if hasattr(keras_model, "inner_model")\
             else keras_model.layers
 
+        # Collect submodel layers
+        if submodel_names:
+            submodel_layers = [l for l in layers if l.name in submodel_names]
+
         # Exclude some layers
         if exclude:
             layers = filter(lambda l: l.name not in exclude, layers)
@@ -2524,6 +2536,15 @@ class MaskRCNN():
             saving.load_weights_from_hdf5_group_by_name(f, layers)
         else:
             saving.load_weights_from_hdf5_group(f, layers)
+
+        if submodel_names:
+            assert len(submodel_names) == len(submodel_layers)
+            for name, layer in zip(submodel_names, submodel_layers):
+                submodel_weights = f[name]
+                print(name, layer, submodel_weights)
+                saving.load_weights_from_hdf5_group(submodel_weights, [layer])
+
+
         if hasattr(f, 'close'):
             f.close()
 
@@ -2671,9 +2692,14 @@ class MaskRCNN():
         self.checkpoint_path = self.checkpoint_path.replace(
             "*epoch*", "{epoch:04d}")
 
-        self.checkpoint_path_resnet = os.path.join(self.log_dir, "mask_rcnn_resnet_{}_*epoch*.h5".format(
+        self.checkpoint_path_resnet_depth = os.path.join(self.log_dir, "mask_rcnn_resnet_depth_{}_*epoch*.h5".format(
             self.config.NAME.lower()))
-        self.checkpoint_path_resnet = self.checkpoint_path_resnet.replace(
+        self.checkpoint_path_resnet_depth = self.checkpoint_path_resnet_depth.replace(
+            "*epoch*", "{epoch:04d}")
+
+        self.checkpoint_path_resnet_rgb = os.path.join(self.log_dir, "mask_rcnn_resnet_rgb_{}_*epoch*.h5".format(
+            self.config.NAME.lower()))
+        self.checkpoint_path_resnet_rgb = self.checkpoint_path_resnet_rgb.replace(
             "*epoch*", "{epoch:04d}")
 
 
@@ -2741,12 +2767,22 @@ class MaskRCNN():
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
 
+        resnet_fpn_depth_weights_callback = lambda epoch, logs:  self.resnet_fpn_depth_model.save_weights(self.checkpoint_path_resnet_depth.format(epoch=epoch+ 1))
+        resnet_fpn_rgb_weights_callback = lambda epoch, logs:  self.resnet_fpn_rgb_model.save_weights(self.checkpoint_path_resnet_rgb.format(epoch=epoch+ 1))
+
+
         # Callbacks
         callbacks = [
             keras.callbacks.TensorBoard(log_dir=self.log_dir,
                                         histogram_freq=0, write_graph=True, write_images=False),
             keras.callbacks.ModelCheckpoint(self.checkpoint_path,
                                             verbose=0, save_weights_only=True),
+            keras.callbacks.LambdaCallback(
+                on_epoch_end=resnet_fpn_depth_weights_callback
+            ),
+            keras.callbacks.LambdaCallback(
+                on_epoch_end=resnet_fpn_rgb_weights_callback
+            )
         ]
 
         # Add custom callbacks to the list
