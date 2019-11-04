@@ -2130,7 +2130,7 @@ class MaskRCNN():
             ### Add target input
             ### Incl [x, y, w, h] BB input for target
             input_target = KL.Input(
-                shape=[config.STACK_SIZE, None, None, config.IMAGE_SHAPE[2]],
+                shape=[config.STACK_SIZE, None, None, config.IMAGE_CHANNEL_COUNT],
                 name="input_target")
 
             input_target_depth = KL.Lambda(lambda x: x[:,:,:,:,3:])(input_target)
@@ -2430,15 +2430,16 @@ class MaskRCNN():
         return checkpoint
 
 
-    def load_weights_siamese(self, filepath, backbone_path):
+    def load_weights_siamese(self, filepath, backbone_path_rgb, backbone_path_depth):
         """Loads weights from a pre-trained Siamese SD Mask R-CNN model.
 
         filepath: path to the *model* weights
         backbone_path: path to the *Resnet backbone* weights (should have "resnet"
             in path)
         """
-        self.load_weights(filepath, exclude=['resnet_fpn_model'])
-        self.resnet_fpn_model.load_weights(backbone_path)
+        self.load_weights(filepath, exclude=['resnet_fpn_depth', 'resnet_fpn_rgb'])
+        self.resnet_fpn_rgb_model.load_weights(backbone_path_rgb)
+        self.resnet_fpn_depth_model.load_weights(backbone_path_depth)
 
 
     def load_weights_from_sd_mrcnn_model(self, filepath, filepath_rgb):
@@ -3006,7 +3007,6 @@ class MaskRCNN():
 
             time_start = time.time()
             # Run object detection
-
             detections, mrcnn_class, mrcnn_bbox, mrcnn_mask, rpn_rois, rpn_class, rpn_bbox, siamese_output, features, target_feature, input_target_bb, target_probs, t1, t2, t3, t4 =\
                 self.keras_model.predict([molded_target_stacks, target_meta_stacks, target_bbs, molded_images, image_metas, anchors], verbose=1)
             time_total = time.time()-time_start
