@@ -1428,7 +1428,8 @@ def load_target(target_dataset, config, target_id):
         target_images.append(target_image)
 
         # need to make one "mask instance"
-        target_image_mask = (np.sum(target_image, axis=2) != 0).astype(np.int32) # mask the target object (now shape is (H, W, 1))
+        target_image_mask = (np.sum(target_image[:,:,:3], axis=2) != 0).astype(np.int32) # mask the target object (now shape is (H, W, 1))
+        assert target_image_mask[0,0] == 0
         bb = utils.extract_bboxes(
             target_image_mask.reshape((target_image.shape[0], target_image.shape[1], 1)))[0]
         target_bbs.append(bb)
