@@ -178,11 +178,8 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
     """
     assert architecture in ["resnet35", "resnet50", "resnet101"]
     # Stage 1
-    print(input_image.shape)
     x = KL.ZeroPadding2D((3, 3))(input_image)
-    print(x.shape)
     x = KL.Conv2D(64, (7, 7), strides=(2, 2), name='conv1', use_bias=True)(x)
-    print(x.shape)
     x = BatchNorm(name='bn_conv1')(x, training=train_bn)
     x = KL.Activation('relu')(x)
     C1 = x = KL.MaxPooling2D((3, 3), strides=(2, 2), padding="same")(x)
@@ -868,7 +865,6 @@ def refine_detections_graph(rois, probs, deltas, target_probs, window, config):
     # Pad with zeros if detections < DETECTION_MAX_INSTANCES
     gap = config.DETECTION_MAX_INSTANCES - tf.shape(detections)[0]
     detections = tf.pad(detections, [(0, gap), (0, 0)], "CONSTANT")
-    detections = tf.Print(detections, [detections, keep, top_ids], summarize=100)
     return detections
 
 
@@ -894,7 +890,6 @@ class DetectionLayer(KE.Layer):
             self.detection_dim = 6
 
     def call(self, inputs):
-        print('input shapes', [i.shape for i in inputs])
         rois = inputs[0]
         mrcnn_class = inputs[1]
         mrcnn_bbox = inputs[2]
@@ -1008,7 +1003,7 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 
 def fpn_target_graph(rois, feature_maps_depth, target_feature_maps_depth, feature_maps_rgb,
                      target_feature_maps_rgb, image_meta,
-                     target_image_meta, input_target_bb, pool_size, stack_size, combiner):
+                     target_image_meta, input_target_bb, pool_size, stack_size, combiner, pre_siamese_layers=False):
     """Builds Siamese network graph for input and target features
     """
     dist_layer_size = 1024
@@ -1019,6 +1014,22 @@ def fpn_target_graph(rois, feature_maps_depth, target_feature_maps_depth, featur
                               name="roi_align_siamese_input")([rois, image_meta] + feature_maps_depth)
     x_input_rgb = PyramidROIAlign([pool_size, pool_size],
                               name="roi_align_siamese_input_rgb")([rois, image_meta] + feature_maps_rgb)
+
+    if pre_siamese_layers:
+        x_input_depth = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                                           name="siamese_input_depth_conv1")(x_input_depth)
+        x_input_depth = KL.TimeDistributed(BatchNorm(),
+                                           name='siamese_input_depth_bn1')(x_input_depth, training=False)
+        x_input_depth = KL.Activation('relu')(x_input_depth)
+
+        x_input_rgb = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                                         name="siamese_input_rgb_conv1")(x_input_rgb)
+        x_input_rgb = KL.TimeDistributed(BatchNorm(),
+                                         name='siamese_input_rgb_bn1')(x_input_rgb, training=False)
+        x_input_rgb = KL.Activation('relu')(x_input_rgb)
+        print('Input independent conv layers active')
+
+
     x_input = KL.Concatenate(axis=2)([x_input_depth, x_input_rgb])
 
     # ROI pooling target
@@ -1049,12 +1060,32 @@ def fpn_target_graph(rois, feature_maps_depth, target_feature_maps_depth, featur
     x_target_depth = combiner(x_target_depth)
     x_target_rgb = combiner(x_target_rgb)
 
+
+    if pre_siamese_layers:
+        x_target_depth = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                               name="siamese_target_depth_conv1")(x_target_depth)
+        x_target_depth = KL.TimeDistributed(BatchNorm(),
+                               name='siamese_target_depth_bn1')(x_target_depth, training=False)
+        x_target_depth = KL.Activation('relu')(x_target_depth)
+
+        x_target_rgb = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
+                               name="siamese_target_rgb_conv1")(x_target_rgb)
+        x_target_rgb = KL.TimeDistributed(BatchNorm(),
+                               name='siamese_target_rgb_bn1')(x_target_rgb, training=False)
+        x_target_rgb = KL.Activation('relu')(x_target_rgb)
+        print('Target independent conv layers active')
+
     x_target = KL.Concatenate(axis=2)([x_target_depth, x_target_rgb])
 
     x_target_stack = KL.Lambda(lambda x: K.repeat_elements(x, K.int_shape(rois)[1], 1))(x_target)
 
+    print_op = KL.Lambda(lambda x: tf.Print(x, [x, K.max(x)], summarize=20))
+
+    # x_input = print_op(x_input)
+    # x_target_stack = print_op(x_target_stack)
+
     x = KL.Subtract(name="comparison_layer")([x_input, x_target_stack])
-    # [batch, num_rois, 7, 7, 256]
+    # [batch, num_rois, 14, 7, 256]
     # TimeDistributed operates over index 1 (num_rois)
 
     # As inspired by fpn_classifier_graph, we run a FC layer over it, implemented
@@ -2153,9 +2184,7 @@ class MaskRCNN():
             def resnet_fpn_target_stack(input_im, resnet_fpn_fn):
                 # switch stack dimension with batch dimension to slice
                 # on stack, not batch
-                print('input_target.shape resnet_fpn_target_stack', input_im.shape)
                 input_im = tf.transpose(input_im, [1, 0, 2, 3, 4])
-                print('input_target.shape resnet_fpn_target_stack transpose', input_im.shape)
                 output_target = utils.batch_slice(
                     [input_im],
                     lambda target: resnet_fpn_fn(target)[:-1],
@@ -2335,7 +2364,8 @@ class MaskRCNN():
                                                 input_image_meta,
                                                 input_target_meta, target_bb,
                                                 config.POOL_SIZE, config.STACK_SIZE,
-                                                config.STACK_COMBINER)
+                                                config.STACK_COMBINER,
+                                                config.PRE_SIAMESE_LAYERS)
                 target_loss = KL.Lambda(
                 lambda x: target_branch_loss_graph(*x, config.POSITIVE_WEIGHT),
                 name="target_branch_loss")(
@@ -2369,7 +2399,8 @@ class MaskRCNN():
                                        input_image_meta,
                                        input_target_meta, target_bb,
                                        config.POOL_SIZE, config.STACK_SIZE,
-                                       config.STACK_COMBINER)
+                                       config.STACK_COMBINER,
+                                       config.PRE_SIAMESE_LAYERS)
                 detections = DetectionLayer(config, name="mrcnn_detection")(
                     [rpn_rois, mrcnn_class, mrcnn_bbox, input_image_meta, pred_target_prob])
             else:
