@@ -1003,7 +1003,7 @@ def build_rpn_model(anchor_stride, anchors_per_location, depth):
 
 def fpn_target_graph(rois, feature_maps_depth, target_feature_maps_depth, feature_maps_rgb,
                      target_feature_maps_rgb, image_meta,
-                     target_image_meta, input_target_bb, pool_size, stack_size, combiner, pre_siamese_layers=False):
+                     target_image_meta, input_target_bb, pool_size, stack_size, combiner):
     """Builds Siamese network graph for input and target features
     """
     dist_layer_size = 1024
@@ -1014,21 +1014,6 @@ def fpn_target_graph(rois, feature_maps_depth, target_feature_maps_depth, featur
                               name="roi_align_siamese_input")([rois, image_meta] + feature_maps_depth)
     x_input_rgb = PyramidROIAlign([pool_size, pool_size],
                               name="roi_align_siamese_input_rgb")([rois, image_meta] + feature_maps_rgb)
-
-    if pre_siamese_layers:
-        x_input_depth = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
-                                           name="siamese_input_depth_conv1")(x_input_depth)
-        x_input_depth = KL.TimeDistributed(BatchNorm(),
-                                           name='siamese_input_depth_bn1')(x_input_depth, training=False)
-        x_input_depth = KL.Activation('relu')(x_input_depth)
-
-        x_input_rgb = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
-                                         name="siamese_input_rgb_conv1")(x_input_rgb)
-        x_input_rgb = KL.TimeDistributed(BatchNorm(),
-                                         name='siamese_input_rgb_bn1')(x_input_rgb, training=False)
-        x_input_rgb = KL.Activation('relu')(x_input_rgb)
-        print('Input independent conv layers active')
-
 
     x_input = KL.Concatenate(axis=2)([x_input_depth, x_input_rgb])
 
@@ -1059,21 +1044,6 @@ def fpn_target_graph(rois, feature_maps_depth, target_feature_maps_depth, featur
 
     x_target_depth = combiner(x_target_depth)
     x_target_rgb = combiner(x_target_rgb)
-
-
-    if pre_siamese_layers:
-        x_target_depth = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
-                               name="siamese_target_depth_conv1")(x_target_depth)
-        x_target_depth = KL.TimeDistributed(BatchNorm(),
-                               name='siamese_target_depth_bn1')(x_target_depth, training=False)
-        x_target_depth = KL.Activation('relu')(x_target_depth)
-
-        x_target_rgb = KL.TimeDistributed(KL.Conv2D(256, (3, 3), padding="same"),
-                               name="siamese_target_rgb_conv1")(x_target_rgb)
-        x_target_rgb = KL.TimeDistributed(BatchNorm(),
-                               name='siamese_target_rgb_bn1')(x_target_rgb, training=False)
-        x_target_rgb = KL.Activation('relu')(x_target_rgb)
-        print('Target independent conv layers active')
 
     x_target = KL.Concatenate(axis=2)([x_target_depth, x_target_rgb])
 
