@@ -862,7 +862,6 @@ def refine_detections_graph(rois, probs, deltas, target_probs, window, config):
     # Pad with zeros if detections < DETECTION_MAX_INSTANCES
     gap = config.DETECTION_MAX_INSTANCES - tf.shape(detections)[0]
     detections = tf.pad(detections, [(0, gap), (0, 0)], "CONSTANT")
-    detections = tf.Print(detections, [detections, keep, top_ids], summarize=100)
     return detections
 
 
@@ -1027,7 +1026,21 @@ def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
         return outputs
 
     x_target = KL.Lambda(roi_align_target_stack)([input_target_bb, target_image_meta] + target_feature_maps)
+    # x_target = KL.Lambda(lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape)))))(x_target)
 
+    print('input, target', x_input.shape, x_target.shape)
+
+    x_target = KL.Lambda(lambda x: K.squeeze(x, axis=2))(x_target)
+    print('squeeze input, target', x_input.shape, x_target.shape)
+
+    # Reducing all 7x7x256 feature crops to dist_layer_size
+    dist_layer_conv = KL.Conv2D(dist_layer_size, (pool_size, pool_size), padding='valid',
+                                name='siamese_dist_layer_conv')
+
+    x_input = KL.TimeDistributed(dist_layer_conv, name='siamese_dist_layer_pile')(x_input)
+    x_target = KL.TimeDistributed(dist_layer_conv, name='siamese_dist_layer_target')(x_target)
+
+    print('conv input, target', x_input.shape, x_target.shape)
     # Combining stacked representations
     assert combiner in ["mean", "max"], combiner + " is an invalid combiner."
     if combiner == "mean":
@@ -1036,24 +1049,35 @@ def fpn_target_graph(rois, feature_maps, target_feature_maps, image_meta,
         combiner = KL.Lambda(lambda x: tf.reduce_max(x, axis=1))
 
     x_target = combiner(x_target)
-    x_target_stack = KL.Lambda(lambda x: K.repeat_elements(x, K.int_shape(rois)[1], 1))(x_target)
+
+    print('combine input, target', x_input.shape, x_target.shape)
+
+    x_target = KL.Lambda(lambda x: K.expand_dims(x, axis=1))(x_target)
+
+    print('expand input, target', x_input.shape, x_target.shape)
+
+    x_target_stack = KL.Lambda(
+        lambda x: K.repeat_elements(x, K.int_shape(rois)[1], 1))(x_target)
+
+    print('stack input, target', x_input.shape, x_target.shape)
 
     x = KL.Subtract(name="comparison_layer")([x_input, x_target_stack])
+
+    print('subtract input, target, x', x_input.shape, x_target.shape, x.shape)
     # [batch, num_rois, 7, 7, 256]
     # TimeDistributed operates over index 1 (num_rois)
 
     # As inspired by fpn_classifier_graph, we run a FC layer over it, implemented
     # with Conv2D
-    x = KL.TimeDistributed(KL.Conv2D(dist_layer_size, (pool_size, pool_size),
-                                          padding="valid"), name='siamese_conv1')(x)
+    x = KL.TimeDistributed(KL.Conv2D(dist_layer_size, (1, 1),
+                                          padding="valid"), name='siamese_fc1')(x)
 
     x = KL.TimeDistributed(BatchNorm(), name='siamese_bn1')(x, training=False)
     x = KL.Activation('relu')(x)
-    x = KL.TimeDistributed(KL.Conv2D(dist_layer_size, (1, 1)),
-                           name="siamese_conv2")(x)
-    x = KL.TimeDistributed(BatchNorm(), name='siamese_bn2')(x, training=False)
-    x = KL.Activation('relu')(x)
-
+    # x = KL.TimeDistributed(KL.Conv2D(dist_layer_size, (1, 1)),
+    #                        name="siamese_fc2")(x)
+    # x = KL.TimeDistributed(BatchNorm(), name='siamese_bn2')(x, training=False)
+    # x = KL.Activation('relu')(x)
     shared = KL.Lambda(lambda x: K.squeeze(K.squeeze(x, 3), 2),
                        name="siamese_pool_squeeze")(x)
 
