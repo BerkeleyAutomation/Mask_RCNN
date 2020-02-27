@@ -1279,6 +1279,7 @@ def target_branch_loss_graph(gt_targets, pred_logits, pred_target_prob, siamese_
     pred_logits: [batch, num_rois, 2]. Predicted logits.
     """
     gt_targets = tf.cast(gt_targets, 'int32')
+    gt_targets = tf.Print(gt_targets, [K.sum(gt_targets), gt_targets])
     loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
         labels=gt_targets, logits=pred_logits
     )
@@ -1435,11 +1436,7 @@ def load_target(target_dataset, config, target_id):
 
         target_images.append(target_image)
 
-        # need to make one "mask instance"
-        target_image_mask = (np.sum(target_image, axis=2) != 0).astype(np.int32) # mask the target object (now shape is (H, W, 1))
-        bb = utils.extract_bboxes(
-            target_image_mask.reshape((target_image.shape[0], target_image.shape[1], 1)))[0]
-        target_bbs.append(bb)
+        target_bbs = example['target_bbs']
 
         active_class_ids = np.array([0, 1])
         target_image_meta = compose_image_meta(target_id, original_shape, target_image.shape,
