@@ -18,7 +18,7 @@ import scipy
 import skimage.color
 import skimage.io
 import skimage.transform
-import urllib.request
+from six.moves.urllib.request import urlopen
 import shutil
 import warnings
 from distutils.version import LooseVersion
@@ -844,7 +844,7 @@ def download_trained_weights(coco_model_path, verbose=1):
     """
     if verbose > 0:
         print("Downloading pretrained model to " + coco_model_path + " ...")
-    with urllib.request.urlopen(COCO_MODEL_URL) as resp, open(coco_model_path, 'wb') as out:
+    with urlopen(COCO_MODEL_URL) as resp, open(coco_model_path, 'wb') as out:
         shutil.copyfileobj(resp, out)
     if verbose > 0:
         print("... done downloading pretrained model!")
