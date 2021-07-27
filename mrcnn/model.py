@@ -1267,14 +1267,14 @@ def target_branch_loss_graph(gt_targets, pred_logits, pred_target_prob, siamese_
     # for weight w, we scale one-hot by w - 1, then add a vector of 1s to
     # all to achieve a multiplicative scaling of w for the positive example,
     # and 1 for the negative example
-    scaling = KL.Lambda(lambda x: x * (positive_weight - 1))(gt_targets)
+    # scaling = KL.Lambda(lambda x: x * (positive_weight - 1))(gt_targets)
 
-    scaling = KL.Add()([scaling, K.ones_like(gt_targets)])
+    # scaling = KL.Add()([scaling, K.ones_like(gt_targets)])
 
-    scaling = tf.cast(scaling, tf.float32)
+    # scaling = tf.cast(scaling, tf.float32)
 
-    scaled_losses = KL.Multiply(name='scaled_loss')([loss, scaling])
-    scalar_loss = K.mean(scaled_losses)
+    # scaled_losses = KL.Multiply(name='scaled_loss')([loss, scaling])
+    scalar_loss = K.mean(loss)
     return scalar_loss
 
 def mrcnn_class_loss_graph(target_class_ids, pred_class_logits,
